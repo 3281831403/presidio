@@ -92,6 +92,12 @@ class AnonymizerEngine(EngineBase):
         # be sorted by start, end to work correctly
         analyzer_results.sort(key=lambda x: (x.start, x.end))
 
+        # Operator resolution must happen before conflict handling so that
+        # keep results can be kept out of the way of every other operator.
+        operators = self.__check_or_add_default_operator(operators)
+
+        analyzer_results = self._fragment_keep_results(analyzer_results, operators)
+
         analyzer_results = self._remove_conflicts_and_get_text_manipulation_data(
             analyzer_results, conflict_resolution
         )
@@ -102,8 +108,6 @@ class AnonymizerEngine(EngineBase):
             )
         else:
             merged_results = analyzer_results
-
-        operators = self.__check_or_add_default_operator(operators)
 
         return self._operate(
             text=text,
@@ -129,6 +133,83 @@ class AnonymizerEngine(EngineBase):
         """
         logger.info(f"Removed anonymizer {anonymizer_cls.__name__}")
         self.operators_factory.remove_anonymize_operator(anonymizer_cls)
+
+    def _fragment_keep_results(
+        self,
+        analyzer_results: List[RecognizerResult],
+        operators: Dict[str, OperatorConfig],
+    ) -> List[RecognizerResult]:
+        """
+        Restrict keep results to the characters no other result claims.
+
+        A keep result is a no-op, so without this step it can win a conflict
+        against a redacting operator (equal indices, containment, or an
+        overlap it scores higher on) and leave the underlying PII in clear.
+        Every character covered by a result using another operator is removed
+        from every keep result, splitting the keep span into the uncovered
+        fragments. Non-keep results are returned with their original spans, so
+        their conflict resolution and emitted items are unchanged. When all
+        results use keep, nothing is fragmented and the original behavior is
+        preserved.
+        """
+        keep_results: List[RecognizerResult] = []
+        other_results: List[RecognizerResult] = []
+        for result in analyzer_results:
+            if self._is_keep_result(result, operators):
+                keep_results.append(result)
+            else:
+                other_results.append(result)
+        if not keep_results or not other_results:
+            return analyzer_results
+
+        other_spans = sorted((result.start, result.end) for result in other_results)
+        fragmented_results: List[RecognizerResult] = list(other_results)
+        for keep_result in keep_results:
+            for start, end in self._subtract_spans(
+                keep_result.start, keep_result.end, other_spans
+            ):
+                fragment = RecognizerResult(
+                    entity_type=keep_result.entity_type,
+                    start=start,
+                    end=end,
+                    score=keep_result.score,
+                )
+                fragmented_results.append(fragment)
+            self.logger.debug(
+                f"fragmented keep result {keep_result} away from results "
+                f"using other operators"
+            )
+        fragmented_results.sort(key=lambda x: (x.start, x.end))
+        return fragmented_results
+
+    @staticmethod
+    def _subtract_spans(
+        start: int, end: int, spans: List[Tuple[int, int]]
+    ) -> List[Tuple[int, int]]:
+        """Return the parts of [start, end) not covered by any of the spans."""
+        fragments = []
+        fragment_start = start
+        for span_start, span_end in spans:
+            if span_end <= fragment_start:
+                continue
+            if span_start >= end:
+                break
+            if span_start > fragment_start:
+                fragments.append((fragment_start, min(span_start, end)))
+            fragment_start = max(fragment_start, span_end)
+            if fragment_start >= end:
+                break
+        if fragment_start < end:
+            fragments.append((fragment_start, end))
+        return fragments
+
+    @staticmethod
+    def _is_keep_result(
+        result: RecognizerResult, operators: Dict[str, OperatorConfig]
+    ) -> bool:
+        """Check whether the operator resolved for a result is keep."""
+        operator = operators.get(result.entity_type) or operators.get("DEFAULT")
+        return operator.operator_name == "keep"
 
     def _remove_conflicts_and_get_text_manipulation_data(
         self,
@@ -282,7 +363,7 @@ class AnonymizerEngine(EngineBase):
         for result in sorted(analyzer_results, key=lambda x: (x.start, x.end)):
             if prev_result is not None:
                 if prev_result.entity_type == result.entity_type:
-                    if re.search(r"^( )+$", text[prev_result.end:result.start]):
+                    if re.search(r"^( )+$", text[prev_result.end : result.start]):
                         merged_results.remove(prev_result)
                         result.start = prev_result.start
             merged_results.append(result)

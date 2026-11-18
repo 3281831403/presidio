@@ -1,8 +1,8 @@
 import logging
 from abc import ABC, abstractmethod
 from collections import Counter
-from collections.abc import Iterable
-from typing import Dict, Iterator, List, Optional, Union
+from collections.abc import Iterable, Iterator
+from typing import Any, Dict, List, Optional, Union
 
 from pandas import DataFrame
 from presidio_analyzer import (
@@ -27,7 +27,7 @@ class AnalysisBuilder(ABC):
         analyzer: Optional[AnalyzerEngine] = None,
         analyzer_score_threshold: Optional[float] = None,
         n_process: int = 1,
-        batch_size: int = 1
+        batch_size: int = 1,
     ) -> None:
         """Initialize the configuration generator.
 
@@ -105,7 +105,7 @@ class JsonAnalysisBuilder(AnalysisBuilder):
             input_dict=data,
             language=language,
             n_process=self.n_process,
-            batch_size=self.batch_size
+            batch_size=self.batch_size,
         )
 
         key_recognizer_result_map = self._generate_analysis_from_results_json(
@@ -122,7 +122,12 @@ class JsonAnalysisBuilder(AnalysisBuilder):
         self, analyzer_results: Iterator[DictAnalyzerResult], prefix: str = ""
     ) -> Dict[str, RecognizerResult]:
         """
-        Generate a configuration from the given analyzer results. Always uses the first recognizer result if there are more than one.
+        Generate a configuration from the given analyzer results.
+
+        Nested dictionaries and lists (including lists of dictionaries) are
+        traversed recursively. For list values the first recognizer result
+        found on any scalar element is used, matching the JsonDataProcessor,
+        which applies the same operator to every element of the list.
 
         :param analyzer_results: The analyzer results.
         :param prefix: The prefix for the configuration keys.
@@ -139,21 +144,91 @@ class JsonAnalysisBuilder(AnalysisBuilder):
         for result in analyzer_results:
             current_key = prefix + result.key
 
-            if isinstance(result.value, dict) and isinstance(
-                result.recognizer_results, Iterator
-            ):
+            if isinstance(result.value, dict):
                 nested_mappings = self._generate_analysis_from_results_json(
                     result.recognizer_results, prefix=current_key + "."
                 )
                 key_recognizer_result_map.update(nested_mappings)
-            first_recognizer_result = next(iter(result.recognizer_results), None)
-            if isinstance(first_recognizer_result, RecognizerResult):
+            elif isinstance(result.value, list):
+                nested_mappings = self._generate_analysis_from_list_results(
+                    result.recognizer_results, prefix=current_key + "."
+                )
+                key_recognizer_result_map.update(nested_mappings)
+
+            first_recognizer_result = self._first_scalar_recognizer_result(
+                result.recognizer_results
+            )
+            if first_recognizer_result is not None:
                 logger.debug(
-                    f"Found result with entity {first_recognizer_result.entity_type} \
-                        in {current_key}"
+                    f"Found result with entity "
+                    f"{first_recognizer_result.entity_type} in {current_key}"
                 )
                 key_recognizer_result_map[current_key] = first_recognizer_result
         return key_recognizer_result_map
+
+    def _generate_analysis_from_list_results(
+        self, list_results: List[Any], prefix: str
+    ) -> Dict[str, RecognizerResult]:
+        """
+        Generate a configuration from the results of a list value.
+
+        :param list_results: Results aligned with the elements of the input
+            list: recognizer-result lists for scalar elements, iterators of
+            DictAnalyzerResult for dictionary elements, or nested lists.
+        :param prefix: The prefix for the configuration keys.
+        :return: The generated configuration.
+        """
+        key_recognizer_result_map = {}
+        for element_results in list_results:
+            if isinstance(element_results, DictAnalyzerResult):
+                element_mappings = self._generate_analysis_from_results_json(
+                    [element_results], prefix=prefix
+                )
+            elif isinstance(element_results, Iterator):
+                # Dictionary elements arrive as the generator returned by
+                # BatchAnalyzerEngine.analyze_dict.
+                element_mappings = self._generate_analysis_from_results_json(
+                    element_results, prefix=prefix
+                )
+            elif isinstance(element_results, list):
+                if element_results and isinstance(
+                    element_results[0], DictAnalyzerResult
+                ):
+                    element_mappings = self._generate_analysis_from_results_json(
+                        element_results, prefix=prefix
+                    )
+                else:
+                    element_mappings = self._generate_analysis_from_list_results(
+                        element_results, prefix=prefix
+                    )
+            else:
+                continue
+            key_recognizer_result_map.update(element_mappings)
+        return key_recognizer_result_map
+
+    @staticmethod
+    def _first_scalar_recognizer_result(
+        recognizer_results: Any,
+    ) -> Optional[RecognizerResult]:
+        """
+        Return the first RecognizerResult attached to a scalar value.
+
+        Nested DictAnalyzerResult elements and empty results are skipped, so
+        only results for the value itself (rather than its children) qualify.
+
+        :param recognizer_results: The recognizer results of one dictionary
+            value, in any of the shapes produced by BatchAnalyzerEngine.
+        :return: The first scalar RecognizerResult, or None.
+        """
+        if isinstance(recognizer_results, RecognizerResult):
+            return recognizer_results
+        if (
+            isinstance(recognizer_results, list)
+            and recognizer_results
+            and isinstance(recognizer_results[0], RecognizerResult)
+        ):
+            return recognizer_results[0]
+        return None
 
 
 class TabularAnalysisBuilder(AnalysisBuilder):
@@ -256,7 +331,7 @@ class PandasAnalysisBuilder(TabularAnalysisBuilder):
                 [val for val in df[column]],
                 language=language,
                 n_process=self.n_process,
-                batch_size=self.batch_size
+                batch_size=self.batch_size,
             )
             column_analyzer_results_map[column] = analyzer_results
 

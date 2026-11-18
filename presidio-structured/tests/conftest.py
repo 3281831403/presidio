@@ -105,3 +105,38 @@ def json_analysis():
             "address.city": "LOCATION",
         }
     )
+
+
+@pytest.fixture
+def customer_export():
+    """Nested customer JSON mixing objects, object arrays and JSON scalars."""
+    return {
+        "customer_id": 1042,
+        "active": True,
+        "nickname": None,
+        "records": [
+            {
+                "name": "John Doe",
+                "ssn": "716-41-5362",
+                "email": "john.doe@example.com",
+                "phone": "(212) 456-7890",
+                "age": 41,
+                "verified": True,
+                "nickname": None,
+                "tags": ["vip", "call 212-555-0143 soon"],
+                "manager": {"name": "Jane Roe", "email": "jane.roe@example.com"},
+            },
+            {
+                "name": "Jill Smith",
+                "ssn": "987-65-4321",
+                "email": "jill.smith@example.com",
+                "phone": "(617) 555-0132",
+                "age": 37,
+                "verified": False,
+                "nickname": None,
+                "tags": [],
+                "manager": {"name": "Joan Bell", "email": "joan.bell@example.com"},
+            },
+        ],
+        "notes": ["plain note", "another plain note"],
+    }

@@ -2,13 +2,14 @@
 
 import pytest
 
-from presidio_anonymizer import BatchDeanonymizeEngine
+from presidio_anonymizer import BatchAnonymizerEngine, BatchDeanonymizeEngine
 from presidio_anonymizer.deanonymize_engine import DeanonymizeEngine
 from presidio_anonymizer.entities import (
     DictRecognizerResult,
     EngineResult,
     OperatorConfig,
     OperatorResult,
+    RecognizerResult,
 )
 from presidio_anonymizer.operators import Decrypt
 
@@ -126,8 +127,8 @@ def test_given_non_string_list_value_we_return_item_unchanged(engine):
     analyzer_results = [
         DictRecognizerResult(
             key="items",
-            value=[ENCRYPTED_TEXT, ["nested", 123], object()],
-            recognizer_results=[[ENTITY], [], []],
+            value=[ENCRYPTED_TEXT, [ENCRYPTED_TEXT, 123, True], object()],
+            recognizer_results=[[ENTITY], [[ENTITY], [], []], []],
         )
     ]
 
@@ -136,8 +137,76 @@ def test_given_non_string_list_value_we_return_item_unchanged(engine):
     )
 
     assert deanonymize_results["items"][0] == DECRYPTED_TEXT
-    assert deanonymize_results["items"][1] == ["nested", 123]
+    # Nested lists are traversed recursively; non-string elements keep type.
+    assert deanonymize_results["items"][1] == [DECRYPTED_TEXT, 123, True]
     assert type(deanonymize_results["items"][2]) is object
+
+
+def test_given_list_of_objects_we_deanonymize_every_field(engine):
+    analyzer_results = [
+        DictRecognizerResult(
+            key="records",
+            value=[
+                {"name": ENCRYPTED_TEXT, "id": 1},
+                {"name": ENCRYPTED_TEXT, "id": 2},
+            ],
+            recognizer_results=[
+                [
+                    DictRecognizerResult(
+                        key="name",
+                        value=ENCRYPTED_TEXT,
+                        recognizer_results=[ENTITY],
+                    ),
+                    DictRecognizerResult(key="id", value=1, recognizer_results=[]),
+                ],
+                [
+                    DictRecognizerResult(
+                        key="name",
+                        value=ENCRYPTED_TEXT,
+                        recognizer_results=[ENTITY],
+                    ),
+                    DictRecognizerResult(key="id", value=2, recognizer_results=[]),
+                ],
+            ],
+        )
+    ]
+
+    deanonymize_results = engine.deanonymize_dict(
+        anonymizer_results=analyzer_results, operators=OPERATORS
+    )
+
+    assert deanonymize_results == {
+        "records": [
+            {"name": DECRYPTED_TEXT, "id": 1},
+            {"name": DECRYPTED_TEXT, "id": 2},
+        ]
+    }
+
+
+def test_given_wrong_key_we_fail_instead_of_silently_returning_ciphertext(engine):
+    wrong_key_operators = {
+        "DEFAULT": OperatorConfig(Decrypt.NAME, {"key": "1234567890abcdef"})
+    }
+    analyzer_results = [
+        DictRecognizerResult(
+            key="records",
+            value=[{"name": ENCRYPTED_TEXT}],
+            recognizer_results=[
+                [
+                    DictRecognizerResult(
+                        key="name",
+                        value=ENCRYPTED_TEXT,
+                        recognizer_results=[ENTITY],
+                    )
+                ]
+            ],
+        )
+    ]
+
+    with pytest.raises(Exception):
+        engine.deanonymize_dict(
+            anonymizer_results=analyzer_results, operators=wrong_key_operators
+        )
 
 
 def test_given_scalar_dict_value_we_return_value_unchanged(engine):
@@ -181,4 +250,106 @@ def test_given_unsupported_kwargs_then_batch_api_rejects_them(engine):
             entities_list=[[ENTITY]],
             operators=OPERATORS,
             language="en",
+        )
+
+
+CRYPTO_KEY = "WmZq4t7w!z%C&F)J"
+WRONG_CRYPTO_KEY = "1234567890abcdef"
+
+CUSTOMER_DOCUMENT = {
+    "customer_id": 1042,
+    "active": True,
+    "nickname": None,
+    "records": [
+        {
+            "name": "John Doe",
+            "age": 41,
+            "verified": True,
+            "nickname": None,
+            "tags": ["vip", "call back soon"],
+            "manager": {"name": "Jane Roe"},
+        },
+        {
+            "name": "Jill Smith",
+            "age": 37,
+            "verified": False,
+            "nickname": None,
+            "tags": [],
+            "manager": {"name": "Joan Bell"},
+        },
+    ],
+    "notes": ["plain note", "another plain note"],
+}
+
+
+def _build_analyzer_results(value):
+    """Build full-span recognizer results for every string leaf."""
+    if isinstance(value, dict):
+        return [
+            DictRecognizerResult(key, item, _build_analyzer_results(item))
+            for key, item in value.items()
+        ]
+    if isinstance(value, list):
+        return [_build_analyzer_results(item) for item in value]
+    if isinstance(value, str):
+        return [RecognizerResult("PERSON", 0, len(value), 0.9)]
+    return []
+
+
+def _build_decrypt_entities(value):
+    """Build full-span decrypt entities for every encrypted string leaf."""
+    if isinstance(value, dict):
+        return [
+            DictRecognizerResult(key, item, _build_decrypt_entities(item))
+            for key, item in value.items()
+        ]
+    if isinstance(value, list):
+        return [_build_decrypt_entities(item) for item in value]
+    if isinstance(value, str):
+        return [OperatorResult(0, len(value), "PERSON")]
+    return []
+
+
+def test_encrypt_then_batch_decrypt_restores_every_field_in_nested_document():
+    batch_anonymizer = BatchAnonymizerEngine()
+    batch_deanonymizer = BatchDeanonymizeEngine()
+    encrypt_operators = {"DEFAULT": OperatorConfig("encrypt", {"key": CRYPTO_KEY})}
+    decrypt_operators = {"DEFAULT": OperatorConfig(Decrypt.NAME, {"key": CRYPTO_KEY})}
+
+    encrypted = batch_anonymizer.anonymize_dict(
+        _build_analyzer_results(CUSTOMER_DOCUMENT),
+        operators=encrypt_operators,
+    )
+    decrypted = batch_deanonymizer.deanonymize_dict(
+        _build_decrypt_entities(encrypted), operators=decrypt_operators
+    )
+
+    # Every field is restored to its original value, type and position.
+    assert decrypted == CUSTOMER_DOCUMENT
+    assert type(decrypted["customer_id"]) is int
+    assert type(decrypted["active"]) is bool
+    assert decrypted["nickname"] is None
+    assert len(decrypted["records"]) == 2
+
+    # The encrypted document really held ciphertext in the string fields.
+    assert encrypted["records"][0]["name"] != "John Doe"
+    assert encrypted["notes"][0] != "plain note"
+
+
+def test_batch_decrypt_with_wrong_key_fails_on_nested_document():
+    batch_anonymizer = BatchAnonymizerEngine()
+    batch_deanonymizer = BatchDeanonymizeEngine()
+    encrypted = batch_anonymizer.anonymize_dict(
+        _build_analyzer_results(CUSTOMER_DOCUMENT),
+        operators={"DEFAULT": OperatorConfig("encrypt", {"key": CRYPTO_KEY})},
+    )
+    wrong_key_operators = {
+        "DEFAULT": OperatorConfig(Decrypt.NAME, {"key": WRONG_CRYPTO_KEY})
+    }
+
+    # A wrong key must raise rather than silently returning the ciphertext.
+    with pytest.raises(Exception):
+        batch_deanonymizer.deanonymize_dict(
+            _build_decrypt_entities(encrypted),
+            operators=wrong_key_operators,
         )

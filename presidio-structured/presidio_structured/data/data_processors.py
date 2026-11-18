@@ -131,91 +131,63 @@ class PandasDataProcessor(DataProcessorBase):
 class JsonDataProcessor(DataProcessorBase):
     """JSON Data Processor, Supports arbitrary nesting of dictionaries and lists."""
 
-    @staticmethod
-    def _get_nested_value(data: Union[Dict, List, None], path: List[str]) -> Any:
-        """
-        Recursively retrieves the value from nested data using a given path.
-
-        :param data: Nested data (list or dictionary).
-        :param path: List of keys/indexes representing the path.
-        :return: Retrieved value.
-        """
-        for i, key in enumerate(path):
-            if isinstance(data, list):
-                if key.isdigit():
-                    data = data[int(key)]
-                else:
-                    return [
-                        JsonDataProcessor._get_nested_value(item, path[i:])
-                        for item in data
-                    ]
-            elif isinstance(data, dict):
-                data = data.get(key)
-            else:
-                return data
-        return data
-
-    @staticmethod
-    def _set_nested_value(data: Union[Dict, List], path: List[str], value: Any) -> None:
-        """
-        Recursively sets a value in nested data using a given path.
-
-        :param data: Nested data (JSON-like).
-        :param path: List of keys/indexes representing the path.
-        :param value: Value to be set.
-        """
-        for i, key in enumerate(path):
-            if isinstance(data, list):
-                if i + 1 < len(path) and path[i + 1].isdigit():
-                    idx = int(path[i + 1])
-                    while len(data) <= idx:
-                        data.append({})
-                    data = data[idx]
-                    continue
-                else:
-                    for item in data:
-                        JsonDataProcessor._set_nested_value(item, path[i:], value)
-                    return
-            elif isinstance(data, dict):
-                if i == len(path) - 1:
-                    data[key] = value
-                else:
-                    data = data.setdefault(key, {})
-
     def _process(
         self,
         data: Union[Dict, List],
         key_to_operator_mapping: Dict[str, Callable],
     ) -> Union[Dict, List]:
         """
-        Operates on the given JSON-like data based on the provided configuration.
+        Operate on the given JSON-like data based on the provided configuration.
+
+        The data is walked recursively, so dictionaries and lists can be nested
+        to any depth, including lists of dictionaries. String values whose
+        dotted key path appears in the operator mapping are operated on; every
+        other value (including non-string scalars and ``None``) is carried over
+        unchanged. The returned object mirrors the input: dictionary key order,
+        value types and list lengths are preserved.
 
         :param data: JSON-like data to be operated on.
-        :param key_to_operator_mapping: maps keys to Callable operators.
+        :param key_to_operator_mapping: maps dotted key paths to Callable
+            operators.
         :return: JSON-like data after the operation.
         """
 
         if not isinstance(data, (dict, list)):
             raise ValueError("Data must be a JSON-like object")
 
-        for key, operator_callable in key_to_operator_mapping.items():
-            self.logger.debug(f"Operating on key {key}")
-            keys = key.split(".")
-            if isinstance(data, list):
-                for item in data:
-                    self._process(item, key_to_operator_mapping)
-            else:
-                text_to_operate_on = self._get_nested_value(data, keys)
-                if text_to_operate_on:
-                    if isinstance(text_to_operate_on, list):
-                        for text in text_to_operate_on:
-                            operated_text = self._operate_on_text(
-                                text, operator_callable
-                            )
-                            self._set_nested_value(data, keys, operated_text)
-                    else:
-                        operated_text = self._operate_on_text(
-                            text_to_operate_on, operator_callable
-                        )
-                        self._set_nested_value(data, keys, operated_text)
+        return self._process_node(data, key_to_operator_mapping, ())
+
+    def _process_node(
+        self,
+        data: Any,
+        key_to_operator_mapping: Dict[str, Callable],
+        path: tuple,
+    ) -> Any:
+        """
+        Recursively operate on one node of the JSON-like data.
+
+        :param data: Dictionary, list or scalar node to operate on.
+        :param key_to_operator_mapping: maps dotted key paths to Callable
+            operators.
+        :param path: Dictionary keys traversed to reach this node. List
+            elements do not add a path segment, so an operator mapped to a key
+            applies to that key in every element of an enclosing list.
+        :return: The operated node.
+        """
+        if isinstance(data, dict):
+            return {
+                key: self._process_node(value, key_to_operator_mapping, (*path, key))
+                for key, value in data.items()
+            }
+        if isinstance(data, list):
+            return [
+                self._process_node(item, key_to_operator_mapping, path) for item in data
+            ]
+        if isinstance(data, str):
+            operator_callable = key_to_operator_mapping.get(".".join(path))
+            if operator_callable is not None:
+                return self._operate_on_text(data, operator_callable)
+            return data
+        # Non-string JSON scalars (int, float, bool, None) and any other
+        # value keep their type and are returned unchanged.
         return data

@@ -40,10 +40,10 @@ def test_given_analyzer_result_we_anonymize_dict_correctly(engine, analyzer_resu
 def test_given_analyzer_result_we_anonymize_list_correctly(
     engine, texts, recognizer_results_list
 ):
-    # new list that will reuse texts  and another inner list with random value
-    # should be ['John', 'Jill', 'Jack', ['random', 123, True]]
+    # Nested lists are traversed recursively; only strings are anonymized,
+    # so the int and bool inside keep their type and value.
     new_texts = texts + [["random", 123, True]]
-    new_recognizer_results_list = recognizer_results_list + [[]]
+    new_recognizer_results_list = recognizer_results_list + [[[], [], []]]
     anonymize_results = engine.anonymize_list(
         texts=new_texts, recognizer_results_list=new_recognizer_results_list
     )
@@ -53,6 +53,84 @@ def test_given_analyzer_result_we_anonymize_list_correctly(
         "<PERSON>",
         ["random", 123, True],
     ]
+
+
+def test_given_short_recognizer_results_we_keep_trailing_texts(engine):
+    # One fewer result set than texts: the trailing text must be returned,
+    # not silently dropped.
+    anonymize_results = engine.anonymize_list(
+        texts=["John", "plain trailing text"],
+        recognizer_results_list=[[RecognizerResult("PERSON", 0, 4, 0.85)]],
+    )
+
+    assert anonymize_results == ["<PERSON>", "plain trailing text"]
+
+
+def test_anonymize_list_recurses_into_nested_lists_and_dicts(engine):
+    texts = [
+        {"name": "John", "age": 42, "active": True},
+        ["Jill", 7, None],
+    ]
+    recognizer_results_list = [
+        [
+            DictRecognizerResult(
+                key="name",
+                value="John",
+                recognizer_results=[RecognizerResult("PERSON", 0, 4, 0.85)],
+            ),
+            DictRecognizerResult(key="age", value=42, recognizer_results=[]),
+            DictRecognizerResult(key="active", value=True, recognizer_results=[]),
+        ],
+        [[RecognizerResult("PERSON", 0, 4, 0.85)], [], []],
+    ]
+
+    anonymize_results = engine.anonymize_list(
+        texts=texts, recognizer_results_list=recognizer_results_list
+    )
+
+    assert anonymize_results == [
+        {"name": "<PERSON>", "age": 42, "active": True},
+        ["<PERSON>", 7, None],
+    ]
+
+
+def test_anonymize_dict_with_list_of_objects_preserves_structure(engine):
+    analyzer_results = [
+        DictRecognizerResult(
+            key="records",
+            value=[
+                {"name": "John", "id": 1},
+                {"name": "Jill", "id": 2},
+            ],
+            recognizer_results=[
+                [
+                    DictRecognizerResult(
+                        key="name",
+                        value="John",
+                        recognizer_results=[RecognizerResult("PERSON", 0, 4, 0.85)],
+                    ),
+                    DictRecognizerResult(key="id", value=1, recognizer_results=[]),
+                ],
+                [
+                    DictRecognizerResult(
+                        key="name",
+                        value="Jill",
+                        recognizer_results=[RecognizerResult("PERSON", 0, 4, 0.85)],
+                    ),
+                    DictRecognizerResult(key="id", value=2, recognizer_results=[]),
+                ],
+            ],
+        )
+    ]
+
+    anonymize_results = engine.anonymize_dict(analyzer_results)
+
+    assert anonymize_results == {
+        "records": [
+            {"name": "<PERSON>", "id": 1},
+            {"name": "<PERSON>", "id": 2},
+        ]
+    }
 
 
 def test_given_empty_recognizers_than_we_return_text_unchanged(engine, texts):

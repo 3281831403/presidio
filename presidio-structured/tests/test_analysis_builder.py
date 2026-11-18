@@ -132,10 +132,14 @@ def test_generate_analysis_json(json_analysis_builder, sample_json):
     assert structured_analysis.entity_mapping["address.city"] == "LOCATION"
 
 
-def test_generate_analysis_json_with_list_should_raise(json_analysis_builder, sample_json_with_array):
-    # this feature is not supported by the BatchAnalyzerEngine used in the JsonAnalysisBuilder
-    with pytest.raises(ValueError):
-        json_analysis_builder.generate_analysis(sample_json_with_array)
+def test_generate_analysis_json_with_list_of_objects(json_analysis_builder, sample_json_with_array):
+    structured_analysis = json_analysis_builder.generate_analysis(
+        sample_json_with_array
+    )
+
+    # Both objects in the "users" array carry the same keys, so the analysis
+    # maps the dotted paths rather than raising.
+    assert structured_analysis.entity_mapping["users.name"] == "PERSON"
 
 
 def test_generate_analysis_json_with_empty_data(json_analysis_builder):

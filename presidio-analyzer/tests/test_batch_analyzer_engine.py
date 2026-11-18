@@ -278,18 +278,81 @@ def test_analyze_dict_nested_with_skipping(
     assert num_results == results_length
 
 
-def test_analyze_list_non_primitive_type_raises_error(batch_analyzer_engine_simple):
-    input_dict = {"key": ["1", "2", {"inner_key": "inner_value"}]}
+def test_analyze_list_of_objects_returns_nested_results(batch_analyzer_engine_simple):
+    input_dict = {"key": ["1", "2", {"inner_key": "Call me at 2121551234"}]}
 
-    with pytest.raises(ValueError):
-        list(
-            batch_analyzer_engine_simple.analyze_dict(
-                input_dict=input_dict, language="en"
-            )
+    results = list(
+        batch_analyzer_engine_simple.analyze_dict(
+            input_dict=input_dict, language="en"
         )
+    )
+
+    [key_result] = results
+    assert key_result.key == "key"
+    assert len(key_result.recognizer_results) == 3
+    assert key_result.recognizer_results[0] == []
+    assert key_result.recognizer_results[1] == []
+    nested = list(key_result.recognizer_results[2])
+    assert nested[0].key == "inner_key"
+    assert nested[0].recognizer_results[0].entity_type == "PHONE_NUMBER"
 
 
-def test_analyze_dict_with_unknown_object_raises_error(batch_analyzer_engine_simple):
+def test_analyze_deeply_nested_mix_of_objects_arrays_and_scalars(
+    batch_analyzer_engine_simple,
+):
+    input_dict = {
+        "records": [
+            {
+                "phone": "2121551234",
+                "site": "www.abc.com",
+                "tags": ["x", "Call me at 2121551234"],
+                "active": True,
+                "score": 1.5,
+                "manager": None,
+            },
+            {
+                "phone": "202-555-1234",
+                "site": "microsoft.com",
+                "tags": [],
+                "active": False,
+                "score": 0,
+                "manager": {"site": "www.boss.com"},
+            },
+        ],
+        "flat": ["www.abc.com", 7, None, False],
+    }
+
+    results = {
+        result.key: result.recognizer_results
+        for result in batch_analyzer_engine_simple.analyze_dict(
+            input_dict=input_dict, language="en"
+        )
+    }
+
+    records = results["records"]
+    assert len(records) == 2  # array length preserved
+    first = {r.key: r.recognizer_results for r in records[0]}
+    second = {r.key: r.recognizer_results for r in records[1]}
+
+    assert first["phone"][0].entity_type == "PHONE_NUMBER"
+    assert first["site"][0].entity_type == "URL"
+    assert first["tags"][1][0].entity_type == "PHONE_NUMBER"
+    # Non-string and empty values carry no results but keep their slot.
+    assert first["active"] == []
+    assert first["score"] == []
+    assert first["manager"] == []
+    assert second["tags"] == []
+    assert second["score"] == []
+    nested_manager = list(second["manager"])
+    assert nested_manager[0].recognizer_results[0].entity_type == "URL"
+
+    flat = results["flat"]
+    assert len(flat) == 4
+    assert flat[0][0].entity_type == "URL"
+    assert flat[1] == [] and flat[2] == [] and flat[3] == []
+
+
+def test_analyze_dict_unknown_object_still_raises_error(batch_analyzer_engine_simple):
     class J:
         pass
 
@@ -299,6 +362,15 @@ def test_analyze_dict_with_unknown_object_raises_error(batch_analyzer_engine_sim
             batch_analyzer_engine_simple.analyze_dict(
                 input_dict=input_dict, language="en"
             )
+        )
+
+
+def test_analyze_iterator_nested_object_still_raises_error(
+    batch_analyzer_engine_simple,
+):
+    with pytest.raises(ValueError):
+        batch_analyzer_engine_simple.analyze_iterator(
+            texts=["1", {"inner_key": "inner_value"}], language="en"
         )
 
 
@@ -318,11 +390,105 @@ def test_batch_analyze_iterator_returns_list_of_recognizer_results(
     texts = ["My name is David", "Call me at 2352351232", "I was born at 1/5/1922"]
     expected_output = [[], [RecognizerResult(entity_type="PHONE_NUMBER", start=11, end=21, score= 0.4)], []]
 
-    results = batch_analyzer_engine_simple.analyze_iterator(texts=texts, 
-                                                            language="en", 
+    results = batch_analyzer_engine_simple.analyze_iterator(texts=texts,
+                                                            language="en",
                                                             batch_size=batch_size,
                                                             n_process=n_process)
 
     assert len(results) == len(expected_output)
     for result, expected_result in zip(results, expected_output):
         assert result == expected_result
+
+
+CUSTOMER_EXPORT = {
+    "customer_id": 1042,
+    "active": True,
+    "nickname": None,
+    "records": [
+        {
+            "name": "John Doe",
+            "ssn": "716-41-5362",
+            "email": "john.doe@example.com",
+            "phone": "(212) 456-7890",
+            "age": 41,
+            "verified": True,
+            "nickname": None,
+            "tags": ["vip", "call 212-555-0143 soon"],
+            "manager": {"name": "Jane Roe", "email": "jane.roe@example.com"},
+        },
+        {
+            "name": "Jill Smith",
+            "ssn": "987-65-4321",
+            "email": "jill.smith@example.com",
+            "phone": "(617) 555-0132",
+            "age": 37,
+            "verified": False,
+            "nickname": None,
+            "tags": [],
+            "manager": {"name": "Joan Bell", "email": "joan.bell@example.com"},
+        },
+    ],
+    "notes": ["plain note", "another plain note"],
+}
+
+
+def test_analyze_dict_handles_arbitrarily_nested_customer_export():
+    engine = BatchAnalyzerEngine()
+
+    results = {
+        result.key: result.recognizer_results
+        for result in engine.analyze_dict(CUSTOMER_EXPORT, language="en")
+    }
+
+    # Top-level object order and array length are represented in the results.
+    assert list(results) == list(CUSTOMER_EXPORT)
+    # Each object element is an analyze_dict generator; materialize once.
+    records = [list(element) for element in results["records"]]
+    assert len(records) == 2
+
+    for record_results, record in zip(records, CUSTOMER_EXPORT["records"]):
+        record_map = {r.key: r.recognizer_results for r in record_results}
+        assert list(record_map) == list(record)  # key order preserved
+
+        assert record_map["name"][0].entity_type == "PERSON"
+        assert any(
+            r.entity_type == "US_SSN" for r in record_map["ssn"]
+        )
+        assert record_map["email"][0].entity_type == "EMAIL_ADDRESS"
+        assert record_map["phone"][0].entity_type == "PHONE_NUMBER"
+
+        # Numbers, booleans and None stay empty but keep their positional slot.
+        assert record_map["age"] == []
+        assert record_map["verified"] == []
+        assert record_map["nickname"] == []
+
+        manager = {r.key: r.recognizer_results for r in record_map["manager"]}
+        assert manager["name"][0].entity_type == "PERSON"
+        assert manager["email"][0].entity_type == "EMAIL_ADDRESS"
+
+    tags = {r.key: r.recognizer_results for r in records[0]}["tags"]
+    assert tags[0] == []
+    assert tags[1][0].entity_type == "PHONE_NUMBER"
+
+    # The empty list and the plain string list keep their length and results.
+    second_tags = {r.key: r.recognizer_results for r in records[1]}["tags"]
+    assert second_tags == []
+    assert results["notes"] == [[], []]
+
+
+def test_analyze_dict_keys_to_skip_applies_inside_object_arrays():
+    engine = BatchAnalyzerEngine()
+
+    results = {
+        result.key: result.recognizer_results
+        for result in engine.analyze_dict(
+            CUSTOMER_EXPORT, language="en", keys_to_skip=["records.ssn"]
+        )
+    }
+
+    records = [list(element) for element in results["records"]]
+    for record_results in records:
+        ssn_result = next(r for r in record_results if r.key == "ssn")
+        assert ssn_result.recognizer_results == []
+        name_result = next(r for r in record_results if r.key == "name")
+        assert name_result.recognizer_results  # other keys still analyzed

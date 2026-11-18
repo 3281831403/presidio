@@ -1,3 +1,4 @@
+import collections.abc
 import logging
 from collections import deque
 from typing import Any, Deque, Dict, Iterable, Iterator, List, Optional, Tuple, Union
@@ -6,6 +7,10 @@ from presidio_analyzer import AnalyzerEngine, DictAnalyzerResult, RecognizerResu
 from presidio_analyzer.nlp_engine import NlpArtifacts
 
 logger = logging.getLogger("presidio-analyzer")
+
+# JSON-like scalar types handled by the batch analyzer. Every other value
+# (custom objects, sets, generators, ...) is rejected as unsupported.
+SCALAR_TYPES = (str, int, bool, float)
 
 
 class BatchAnalyzerEngine:
@@ -84,13 +89,17 @@ class BatchAnalyzerEngine:
         **kwargs,
     ) -> Iterator[DictAnalyzerResult]:
         """
-        Analyze a dictionary of keys (strings) and values/iterable of values.
+        Analyze a dictionary of keys (strings) and values of any JSON-like type.
 
-        Non-string values are returned as is.
+        Values can be scalars (str, int, bool, float), nested dictionaries or
+        lists, including lists of nested dictionaries/lists. Non-string and
+        empty values are returned without recognizer results.
 
         :param input_dict: The input dictionary for analysis
         :param language: Input language
-        :param keys_to_skip: Keys to ignore during analysis
+        :param keys_to_skip: Keys to ignore during analysis. Nested keys are
+        addressed with a dotted path (e.g. ``"address.city"``); a key skipped
+        inside a list is skipped in every element of that list.
         :param batch_size: Batch size to process in a single iteration
         :param n_process: Number of processors to use. Defaults to `1`
 
@@ -118,37 +127,143 @@ class BatchAnalyzerEngine:
             specific_context = context[:]
             specific_context.append(key)
 
-            if type(value) in (str, int, bool, float):
-                results: List[RecognizerResult] = self.analyzer_engine.analyze(
-                    text=str(value),
-                    language=language,
-                    context=specific_context,
-                    **kwargs,
-                )
-            elif isinstance(value, dict):
-                new_keys_to_skip = self._get_nested_keys_to_skip(key, keys_to_skip)
-                results = self.analyze_dict(
-                    input_dict=value,
-                    language=language,
-                    context=specific_context,
-                    keys_to_skip=new_keys_to_skip,
-                    **kwargs,
-                )
-            elif isinstance(value, Iterable):
-                # Recursively iterate nested dicts
+            results = self._analyze_value(
+                value=value,
+                language=language,
+                context=specific_context,
+                keys_to_skip=self._get_nested_keys_to_skip(key, keys_to_skip),
+                batch_size=batch_size,
+                n_process=n_process,
+                **kwargs,
+            )
 
-                results: List[List[RecognizerResult]] = self.analyze_iterator(
-                    texts=value,
-                    language=language,
-                    context=specific_context,
-                    n_process=n_process,
-                    batch_size=batch_size,
-                    **kwargs,
+            yield DictAnalyzerResult(key=key, value=value, recognizer_results=results)
+
+    def _analyze_value(
+        self,
+        value: Any,
+        language: str,
+        context: List[str],
+        keys_to_skip: List[str],
+        batch_size: int,
+        n_process: int,
+        **kwargs,
+    ) -> Union[List[RecognizerResult], Iterator[DictAnalyzerResult], List[Any]]:
+        """Analyze a single dictionary value of any supported JSON-like type."""
+        if type(value) in SCALAR_TYPES:
+            return self.analyzer_engine.analyze(
+                text=str(value),
+                language=language,
+                context=context,
+                **kwargs,
+            )
+        if isinstance(value, dict):
+            return self.analyze_dict(
+                input_dict=value,
+                language=language,
+                context=context,
+                keys_to_skip=keys_to_skip,
+                batch_size=batch_size,
+                n_process=n_process,
+                **kwargs,
+            )
+        if isinstance(value, list):
+            return self._analyze_list(
+                values=value,
+                language=language,
+                context=context,
+                keys_to_skip=keys_to_skip,
+                batch_size=batch_size,
+                n_process=n_process,
+                **kwargs,
+            )
+        if isinstance(value, collections.abc.Iterable):
+            # Other iterables (tuples, sets, ...) only ever held primitives;
+            # keep routing them through the flat NLP batch pipeline.
+            return self.analyze_iterator(
+                texts=value,
+                language=language,
+                context=context,
+                n_process=n_process,
+                batch_size=batch_size,
+                **kwargs,
+            )
+        raise ValueError(f"type {type(value)} is unsupported.")
+
+    def _analyze_list(
+        self,
+        values: List[Any],
+        language: str,
+        context: List[str],
+        keys_to_skip: List[str],
+        batch_size: int,
+        n_process: int,
+        **kwargs,
+    ) -> List[Any]:
+        """
+        Analyze a list, preserving its order and length.
+
+        Scalar runs are analyzed together through the NLP batch pipeline while
+        nested dictionaries and lists are analyzed recursively. The result for
+        each element aligns positionally with the input element.
+        """
+        results: List[Any] = []
+        scalar_run: List[Any] = []
+        scalar_run_indexes: List[int] = []
+
+        def flush_scalar_run() -> None:
+            if not scalar_run:
+                return
+            scalar_results = self.analyze_iterator(
+                texts=scalar_run,
+                language=language,
+                context=context,
+                n_process=n_process,
+                batch_size=batch_size,
+                **kwargs,
+            )
+            for index, scalar_result in zip(scalar_run_indexes, scalar_results):
+                results[index] = scalar_result
+            scalar_run.clear()
+            scalar_run_indexes.clear()
+
+        for value in values:
+            if value is None or type(value) in SCALAR_TYPES:
+                # analyze_iterator handles None and empty values as no-results.
+                scalar_run.append(value)
+                scalar_run_indexes.append(len(results))
+                results.append(None)
+            elif isinstance(value, dict):
+                flush_scalar_run()
+                results.append(
+                    self.analyze_dict(
+                        input_dict=value,
+                        language=language,
+                        context=context,
+                        keys_to_skip=keys_to_skip,
+                        batch_size=batch_size,
+                        n_process=n_process,
+                        **kwargs,
+                    )
+                )
+            elif isinstance(value, list):
+                flush_scalar_run()
+                results.append(
+                    self._analyze_list(
+                        values=value,
+                        language=language,
+                        context=context,
+                        keys_to_skip=keys_to_skip,
+                        batch_size=batch_size,
+                        n_process=n_process,
+                        **kwargs,
+                    )
                 )
             else:
                 raise ValueError(f"type {type(value)} is unsupported.")
 
-            yield DictAnalyzerResult(key=key, value=value, recognizer_results=results)
+        flush_scalar_run()
+        return results
 
     def _normalize_texts(
         self, texts: Iterable[Any], original_texts: Deque[Any], language: str
@@ -167,7 +282,7 @@ class BatchAnalyzerEngine:
                 err_msg = (
                     "Analyzer.analyze_iterator only works "
                     "on primitive types (int, float, bool, str). "
-                    "Lists of objects are not yet supported."
+                    "Analyze nested objects through analyze_dict."
                 )
                 logger.error(err_msg)
                 raise ValueError(err_msg)
